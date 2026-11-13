@@ -5,7 +5,7 @@ set -uo pipefail
 
 B=$'\e[1m'; G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; D=$'\e[2m'; N=$'\e[0m'
 h() { # rubrik – väntar på Enter först (inte när utdata går till pipe/fil)
-  [[ -t 1 ]] && read -rsp "${D}[Enter] → $1${N}" </dev/tty && printf '\r\e[K'
+  [[ -t 1 ]] && read -rsp "${D}[Enter] → $1${N}" </dev/tty && printf '\e[H\e[2J\e[3J'
   printf '\n%s━━ %s ━━%s\n' "$B" "$1" "$N"
 }
 color() { sed -e "s/success/${G}success${N}/g" -e "s/failure/${R}failure${N}/g" -e "s/skipped/${Y}skipped${N}/g"; }
