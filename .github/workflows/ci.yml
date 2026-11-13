@@ -1,0 +1,305 @@
+# Utpost – CI (M1, utbyggd i M4, M5, M6, M7)
+# Varje PR mot main och varje push till main: lint, formatkontroll, typkontroll, tester och bygge.
+# Rött någonstans = PR:en får inte mergas (branch protection kräver "Kvalitet", "Bygg", "Integration" och "Image").
+# M4: jobbet Image bygger Docker-imagerna. På PR byggs de bara (går Dockerfilen igenom?),
+# på main byggs de och publiceras i GHCR, taggade med commitens sha.
+# M5: jobbet Integration kör API-testerna mot riktiga databaser som startas för jobbet (services).
+# M6: jobbet Deploy → Azure staging byter image i staging efter merge till main.
+# M7: jobbet Deploy → Azure Functions lägger upp functions/ i function-appen efter merge till main.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Minsta möjliga rättigheter för GITHUB_TOKEN – pipelinen behöver bara läsa repot.
+permissions:
+  contents: read
+
+# Ny push till samma PR avbryter den pågående körningen – sparar minuter i kön.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Kvalitet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm            # cachar ~/.npm nycklat på package-lock.json
+      - run: npm ci             # installerar alla workspaces (shared, api, client) – exakt enligt lockfilen
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck   # M2: vue-tsc i client/ och tsc i api/. M5: kör codegen först – schema → fråga → vy kontrolleras här
+      - run: npm test            # klientens tester (Vitest + Testing Library, API:et mockat)
+
+  # M5: integrationstester mot GraphQL-servern med riktig databas. Postgres och Mongo startas som
+  # services bredvid jobbet – samma images som i compose.yaml – och nås på localhost.
+  integration:
+    name: Integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: utpost
+          POSTGRES_PASSWORD: utpost
+          POSTGRES_DB: utpost
+        ports:
+          - 5432:5432              # i jobbet: localhost:5432 (inte 5433 som på din dator)
+        options: >-
+          --health-cmd "pg_isready -U utpost -d utpost"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      mongo:
+        image: mongo:8.2
+        env:
+          MONGO_INITDB_ROOT_USERNAME: utpost
+          MONGO_INITDB_ROOT_PASSWORD: utpost
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok'"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # Samma variabler som compose sätter för api – men här är databaserna på localhost.
+      DATABASE_URL: postgres://utpost:utpost@localhost:5432/utpost
+      MONGO_URL: mongodb://utpost:utpost@localhost:27017/utpost?authSource=admin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run seed          # tom databas → testdata, exakt som lokalt
+      - run: npm run migrate:logs  # mätpunkterna till Mongo – testet för Tour.logs kräver det
+      - run: npm run test:api
+
+  build:
+    name: Bygg
+    runs-on: ubuntu-latest     # körs parallellt med quality – de behöver inte varandra
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-dist
+          path: client/dist
+          retention-days: 7
+
+  image:
+    name: Image
+    runs-on: ubuntu-latest
+    needs: [quality, build]    # ingen image av kod som inte klarat kontrollerna
+    permissions:
+      contents: read
+      packages: write          # GITHUB_TOKEN får publicera i GHCR – bara i det här jobbet
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # Inloggning behövs bara när vi ska publicera, alltså på main.
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Räknar ut namn och taggar: ghcr.io/<ägare>/<repo>-api:sha-1a2b3c4 och :latest på main.
+      # (metadata-action gör också namnet till gemener, vilket GHCR kräver.)
+      - id: meta-api
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}-api
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .                   # repots rot, som i compose.yaml
+          file: api/Dockerfile
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta-api.outputs.tags }}
+          labels: ${{ steps.meta-api.outputs.labels }}
+          build-args: GIT_SHA=${{ github.sha }}   # M6: syns i /api/health – deploysteget väntar på den
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - id: meta-client
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}-client
+          tags: |
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: client/Dockerfile
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta-client.outputs.tags }}
+          labels: ${{ steps.meta-client.outputs.labels }}
+          cache-from: type=gha,scope=client
+          cache-to: type=gha,mode=max,scope=client
+
+  # M6: merge till main → staging i Azure Container Apps kör den nya imagen.
+  # Jobbet bygger ingenting – det byter image i en app som redan finns (infra/azure/skapa-staging.sh),
+  # väntar tills /api/health svarar med rätt sha, och röktestar GraphQL genom nginx.
+  deploy:
+    name: Deploy → Azure staging
+    runs-on: ubuntu-latest
+    needs: [image, integration]                      # samma image som Image publicerade; aldrig en deploy av kod med röda API-tester
+    # M8: körs bara om miljön azure-staging har sina variabler – i ett repo utan Azure (labbparen) hoppas jobbet över i stället för att bli rött.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AZURE_APP != ''
+    environment:
+      name: azure-staging                            # variablerna (id:n och adressen) ligger på miljön, inte i repot
+      url: ${{ vars.AZURE_URL }}
+    permissions:
+      id-token: write                                # får be GitHub om en kortlivad OIDC-token – det finns ingen lösenordshemlighet
+      contents: read
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false                      # två deployer i rad får köa, inte avbryta varandra
+    steps:
+      - name: Logga in i Azure med GitHubs identitet (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Byt image på api och client – exakt den här committen
+        env:
+          RG: ${{ vars.AZURE_RG }}
+          APP: ${{ vars.AZURE_APP }}
+        run: |
+          az extension add --name containerapp --upgrade --only-show-errors
+          REPO="${GITHUB_REPOSITORY,,}"                        # GHCR kräver gemener
+          TAG="sha-${GITHUB_SHA::7}"                           # samma tagg som docker/metadata-action satte i Image
+          # --container-name tar en container per anrop → två anrop, två revisioner (den första kör
+          # ny api med gammal client några sekunder). Suffixen gör namnen förutsägbara – och ett
+          # suffix går bara att använda en gång: en omkörning av jobbet kräver en ny commit.
+          az containerapp update --name "$APP" --resource-group "$RG" \
+            --container-name api --image "ghcr.io/${REPO}-api:${TAG}" \
+            --revision-suffix "${TAG}-api" --output none
+          az containerapp update --name "$APP" --resource-group "$RG" \
+            --container-name client --image "ghcr.io/${REPO}-client:${TAG}" \
+            --revision-suffix "${TAG}" \
+            --query properties.latestRevisionName --output tsv
+
+      - name: Vänta tills staging kör den här committen
+        env:
+          URL: ${{ vars.AZURE_URL }}
+          RG: ${{ vars.AZURE_RG }}
+          APP: ${{ vars.AZURE_APP }}
+        run: |
+          URL="${URL%/}"
+          TAG="sha-${GITHUB_SHA::7}"
+          for i in $(seq 1 30); do
+            # Anropet går genom nginx i client-containern – svarar health med rätt sha är hela kedjan uppe.
+            LIVE=$(curl -fsS --max-time 20 "$URL/api/health" 2>/dev/null | sed -n 's/.*"sha":"\([^"]*\)".*/\1/p' || true)
+            # …och den revision som svarar ska vara den sista (client-uppdateringen), inte mellanrevisionen.
+            REV=$(az containerapp show --name "$APP" --resource-group "$RG" --query properties.latestReadyRevisionName --output tsv 2>/dev/null || true)
+            if [ "$LIVE" = "$GITHUB_SHA" ] && [ "${REV##*--}" = "$TAG" ]; then
+              echo "✅ $URL kör $GITHUB_SHA (revision $REV)"
+              exit 0
+            fi
+            echo "Försök $i/30: staging kör ${LIVE:-(inget svar ännu – appen väcks från noll?)}, klar revision ${REV:-?}, väntar 10 s"
+            sleep 10
+          done
+          echo "::error::Staging kör inte $GITHUB_SHA efter 5 minuter. Kolla Revisions and replicas i portalen, eller az containerapp logs show --container api."
+          exit 1
+
+      - name: Röktest – GraphQL genom nginx-proxyn
+        env:
+          URL: ${{ vars.AZURE_URL }}
+        run: |
+          URL="${URL%/}"
+          SVAR=$(curl -fsS --max-time 20 "$URL/graphql" -H 'Content-Type: application/json' \
+            -d '{"query":"{ tours(limit: 1) { id user { displayName } } }"}')
+          echo "$SVAR"
+          echo "$SVAR" | grep -q '"displayName"' || { echo "::error::GraphQL svarade utan data"; exit 1; }
+          echo "✅ /graphql svarar via nginx, med data ur en seedad databas"
+
+  # M7: merge till main → bildfunktionen i Azure Functions kör den nya koden i functions/.
+  # Oberoende av Deploy → Azure staging: API:et läser funktionens adress ur miljön (IMAGE_FUNCTION_URL),
+  # så ordningen mellan de två deployjobben spelar ingen roll. Samma miljö och samma OIDC-identitet som
+  # M6 – Contributor på resursgruppen räcker för function-appen. Function-appen skapas en gång av
+  # infra/azure/skapa-funktion.sh; jobbet skapar inget, det lägger bara upp ett nytt paket.
+  deploy-function:
+    name: Deploy → Azure Functions
+    runs-on: ubuntu-latest
+    needs: [quality]                                 # functions/ har inga egna tester – men ingen deploy av en röd main
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AZURE_FUNCTION_APP != ''   # M8: hoppas över utan Azure-variabler, som Deploy → Azure staging
+    environment:
+      name: azure-staging                            # AZURE_FUNCTION_APP ligger här bredvid id:n från M6
+    permissions:
+      id-token: write                                # OIDC-token, inget lösenord
+      contents: read
+    concurrency:
+      group: deploy-function
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: functions/package-lock.json
+
+      # Paketet byggs här, inte i Azure: node_modules följer med i zippen (Microsofts Node-exempel för
+      # GitHub Actions gör likadant). Därför är functions/ ett eget paket med egen lockfil, inte en workspace –
+      # annars hamnar beroendena i rotens node_modules och paketet saknar dem.
+      - name: Installera funktionens beroenden (bara det som körs)
+        working-directory: functions
+        run: npm ci --omit=dev
+
+      - name: Logga in i Azure med GitHubs identitet (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      # Flex Consumption: paketet läggs i en blob-container i appens storage-konto och appen startar om
+      # från det. sku behövs bara med publish-profile (inte med OIDC), remote-build bara om Azure ska köra
+      # npm install – det har vi redan gjort.
+      - name: Lägg upp functions/ i function-appen
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ vars.AZURE_FUNCTION_APP }}
+          package: functions
+          respect-funcignore: true                   # local.settings*.json följer inte med
+
+      - name: Röktest – process-image svarar med fyra varianter
+        env:
+          APP: ${{ vars.AZURE_FUNCTION_APP }}
+          RG: ${{ vars.AZURE_RG }}
+        run: |
+          # Nyckeln ligger inte i GitHub: jobbet hämtar den med sin identitet och maskerar den i loggen
+          # innan den används. Den finns bara i det här steget.
+          KEY=$(az functionapp keys list --name "$APP" --resource-group "$RG" --query functionKeys.default --output tsv)
+          echo "::add-mask::$KEY"
+          [ -n "$KEY" ] || { echo "::error::Fick ingen funktionsnyckel för $APP i $RG"; exit 1; }
+          URL="https://$(az functionapp show --name "$APP" --resource-group "$RG" --query defaultHostName --output tsv)/api/process-image"
+          # Första anropet efter en deploy är en kallstart – därför 60 s och inte 20.
+          SVAR=$(curl -fsS --max-time 60 -X POST "$URL" -H "x-functions-key: $KEY" \
+            -H 'Content-Type: application/json' -d '{"filename":"rooktest.jpg","width":400,"height":300}')
+          echo "$SVAR"
+          echo "$SVAR" | grep -q '"variants"' || { echo "::error::process-image svarade utan variants"; exit 1; }
+          echo "✅ $URL svarar"
