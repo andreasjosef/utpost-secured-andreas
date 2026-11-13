@@ -94,6 +94,8 @@ Skuld 9 var *öppna endpoints, ingen validering av indata, strängkonkatenerade 
 
 Checklistan: `docs/security.md`.
 
+**Säkerhetsskanning i pipelinen (fredagens labb, M8):** jobbet *Säkerhet* i `ci.yml` kör på varje PR: `npm audit` (beroenden med kända sårbarheter), Trivy mot repot (beroenden, hemligheter, Dockerfiles) och mot api-imagen, och ZAP baseline mot den körande appen (saknade säkerhetsheaders, läckt serverinfo). `security-headers.conf` sätter CSP och de andra headrarna i varje nginx-location; `.trivyignore` och `.zap/rules.tsv` säger vad som är ett stopp och vad som är ett medvetet undantag. API:et har ingen CORS längre – browsern når det genom nginx eller Vites proxy, från samma origin.
+
 ## I molnet (M6)
 
 Staging kör i **Azure Container Apps** som en app med fyra containrar (`infra/azure/staging.yaml`). Skapa den en gång med `infra/azure/skapa-staging.sh`, ge pipelinen en identitet med `infra/azure/identitet.sh` (OIDC – inga lösenord i GitHub, bara id:n som variabler på miljön `azure-staging`); därefter deployar pipelinen vid varje merge till `main` (jobbet *Deploy → Azure staging*, se `docs/pipeline.md`): byter image till commitens sha, väntar tills `/api/health` svarar med samma sha, röktestar `/graphql`. Appen skalar till noll mellan passen: första anropet väcker den (räkna med en minut), och databaserna seedas om vid varje kallstart (`SEED_ON_START=1`). Beslutet och alternativen står i `docs/decisions/hosting.md`.

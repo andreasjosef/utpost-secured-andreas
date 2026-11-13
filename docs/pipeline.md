@@ -10,11 +10,13 @@ flowchart LR
   PR --> Q[Kvalitet<br/>npm ci · lint · format:check · typecheck · test]
   PR --> BU[Bygg<br/>npm ci · build → artefakt]
   PR --> I[Integration<br/>postgres + mongo som services · seed · migrate:logs · test:api]
+  PR --> SEC[Säkerhet<br/>npm audit · Trivy repo + image · compose up · ZAP baseline]
   Q --> IM[Image<br/>bygger api + client · publicerar i GHCR på main]
   BU --> IM
   Q --> S{status checks<br/>gröna?}
   BU --> S
   I --> S
+  SEC --> S
   IM --> S
   S -->|ja| M[merge – knappen är grön]
   S -->|nej| F[fixa, pusha igen<br/>körningen startar om]
@@ -37,6 +39,7 @@ flowchart LR
 | Integration (M5) | `npm run test:api` mot Postgres och Mongo som *services* | resolvers som inte stämmer med databasen, N+1 som kommit tillbaka, mutationer utan inloggningskrav – det klientens mockade tester aldrig ser | ~40 s inkl. start av databaserna |
 | Deploy (M6) | `az containerapp update … --image …:sha-…` ×2 (api, client – två revisioner per deploy), vänta på `sha` i `/api/health` och på sista revisionen, röktest `/graphql` | en image som inte startar, en nginx-mall som inte renderas, en app som inte kommer upp – innan någon användare ser det | ______ (bara på `main`; väcks appen från noll tillkommer ~1 min) |
 | Deploy → Azure Functions (M7) | `npm ci --omit=dev` i `functions/`, `Azure/functions-action@v1` (paketet `functions/` till function-appen), röktest: `POST /api/process-image` med nyckeln hämtad i jobbet | en funktion som inte startar i Azure, ett paket utan `node_modules`, fel app-namn – innan en uppladdning i staging får 502 | ______ (bara på `main`; röktestet är en kallstart) |
+| Säkerhet (M8) | `npm audit --omit=dev --audit-level=high` · Trivy `fs` (vuln, secret, misconfig) · `docker compose up --build` · Trivy `image` på `utpost-api` · ZAP baseline mot `localhost:3001` | ett beroende med känd sårbarhet (SCA), en nyckel som råkat committas, en Dockerfile som kör som root, en Alpine-sårbarhet i imagen, en saknad säkerhetsheader eller en läckt serverversion i den körande appen (DAST) | ~5 min (bygget av imagerna dominerar; ZAP spindlar en minut) |
 | Image (M4) | `docker/build-push-action` på `api/Dockerfile` och `client/Dockerfile` | en Dockerfile som inte går att bygga; på `main` publiceras imagerna med `sha-`tagg | ~1,5 min |
 
 `npm ci` dominerar – den installerar alla workspaces (`shared`, `api`, `client`). React-klienten `web/` och dess beroenden togs bort i M6.
@@ -44,7 +47,7 @@ flowchart LR
 ## Branch protection (ruleset på `main`)
 
 - Kräver PR – ingen pushar direkt till `main`
-- Kräver status checks **Kvalitet**, **Bygg**, **Integration** och **Image** gröna innan merge
+- Kräver status checks **Kvalitet**, **Bygg**, **Integration**, **Säkerhet** och **Image** gröna innan merge
 - Kräver att branchen är uppdaterad mot `main` före merge (annars testas en kod som aldrig kommer att finnas)
 - Gäller även admins
 - *Deploy → Azure Functions* (M7) är inte heller en status check. **Två deployjobb, oberoende av varandra** – API:et läser funktionens adress ur miljön (`IMAGE_FUNCTION_URL`), så ordningen spelar ingen roll, och det ena kan vara rött utan att det andra är det.
@@ -54,7 +57,7 @@ flowchart LR
 
 - **Grönt lokalt, rött i CI:** `npm run lint` lokalt är samma kommando som i CI. Kör det innan du pushar. Skillnaden brukar vara en fil som inte är sparad, eller `--fix` lokalt som gömde felet.
 - **`format:check` rött:** kör `npm run format --workspace=client` och committa. CI ska aldrig ändra kod, bara säga nej.
-- **Status check heter fel i rulesetet:** namnet är jobbets `name:` (Kvalitet, Bygg, Integration, Image) – inte filnamnet.
+- **Status check heter fel i rulesetet:** namnet är jobbets `name:` (Kvalitet, Bygg, Integration, Säkerhet, Image) – inte filnamnet.
 - **Integration rött men testerna gröna lokalt:** databasen i jobbet är tom tills `npm run seed` körts, och `Tour.logs` läser Mongo – `npm run migrate:logs` måste också ha körts. Portarna är `5432`/`27017` på `localhost` i jobbet, inte `5433` som i compose.
 - **Deploy rött med *AADSTS700213 No matching federated identity record*:** subjectet stämmer inte. Felmeddelandet skriver ut det subject GitHub skickade – skapa en federerad identitet till med exakt det värdet (`az ad app federated-credential create`, nytt `name`). Jobbet måste också ha `environment: azure-staging`.
 - **Deploy rött på *Vänta tills staging kör den här committen*:** appen startar från noll (fyra containrar + seed, ~1 min) – 30 försök à 10 s brukar räcka. Står `sha` kvar på det gamla värdet efter fem minuter: revisionen startade inte. `az containerapp logs show --name utpost-staging --resource-group utpost-rg --container api --tail 50`.
@@ -65,3 +68,7 @@ flowchart LR
 - **Röktestet ger 401:** fel eller ingen nyckel – jobbet hämtar den med `az functionapp keys list`. Står det *Fick ingen funktionsnyckel*: kontrollera `AZURE_RG` och att identiteten har Contributor på just den resursgruppen.
 - **functions-action rött med *Resource … not found* / *app-name*:** variabeln `AZURE_FUNCTION_APP` på miljön `azure-staging` saknas eller har fel namn (`gh variable list --env azure-staging`). Namnet är appens, utan `.azurewebsites.net`.
 - **Deployen grön men funktionen svarar 404 eller 500 *Cannot find module '@azure/functions'*:** paketet saknar `node_modules`. `npm ci --omit=dev` måste köras i `functions/` före functions-action, och `functions/` får inte vara en workspace i roten (då hamnar beroendena i rotens `node_modules`). Vill man låta Azure installera i stället: `remote-build: true` och inget `npm ci` – inte båda.
+- **Säkerhet rött på `npm audit`:** `npm audit --omit=dev` lokalt säger vilket paket. `npm audit fix` tar det som går utan major-byte; en major (`fix available via drizzle-orm@0.45` med *(MAJOR)*) installerar ni själva och kör testerna. Hittar auditen något utan fix: skriv det under *Kända brister* i `docs/security.md` och gå vidare – jobbet får inte stå rött i veckor för ett paket ingen kan laga.
+- **Säkerhet rött på Trivy `fs` med `DS-0002` eller en hemlighet:** Dockerfilen kör som root → `USER node` (api). nginx-imagen får undantaget i `.trivyignore` med motivering. En hemlighet i repot är aldrig ett undantag: ta bort den, rotera den (den är bränd – historiken finns kvar), committa.
+- **Säkerhet rött på ZAP:** raden i loggen säger regel-id och URL. `FAIL-NEW: 1` + `10038` = CSP saknas på den adressen – oftast en location i `nginx.conf.template` utan `include security-headers.conf`. Reglerna och vad de får göra står i `.zap/rules.tsv`. En WARN gör inte jobbet rött (`-I` i `cmd_options`) – utan den flaggan räknar actionen även varningar som fel. Rapporten (`zap-rapport`) ligger under körningens artefakter.
+- **Säkerhet rött på `compose up --wait`:** `docker compose logs api` i jobbet (steget *Loggar från appen* skriver ut dem) – oftast samma fel som lokalt: en image som inte startar eller `SEED_ON_START` som misslyckas.
