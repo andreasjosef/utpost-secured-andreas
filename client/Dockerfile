@@ -27,3 +27,7 @@ COPY --from=build /app/client/dist /usr/share/nginx/html
 
 EXPOSE 80
 # nginx-imagen har redan ett CMD som startar servern.
+
+# M8 (Trivy DS-0002): nginx-imagen startar som root för att få lyssna på port 80 och byter sedan
+# själv till användaren nginx för arbetsprocesserna. Vi låter det vara – och skriver undantaget
+# i .trivyignore med motivering. Alternativet är nginxinc/nginx-unprivileged på port 8080.

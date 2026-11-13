@@ -117,6 +117,19 @@ jobs:
           ignore-unfixed: true
           exit-code: '1'
           trivyignores: .trivyignore
+      # Hela appen startas som i compose – det är den ZAP ska anropa, och api-imagen som Trivy ska skanna.
+      - name: Bygg imagerna och starta appen (compose)
+        run: docker compose up -d --build --wait
+
+      - name: "Imagen – Trivy (api-imagen: Alpine-paket, Node, npm-paket)"
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: utpost-api
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          trivyignores: .trivyignore
   build:
     name: Bygg
     runs-on: ubuntu-latest     # körs parallellt med quality – de behöver inte varandra
