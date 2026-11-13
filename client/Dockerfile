@@ -22,8 +22,14 @@ FROM nginx:1.27-alpine
 # när containern startar och skriver resultatet till /etc/nginx/conf.d/ – så ${API_UPSTREAM} i mallen
 # blir api:4000 i compose och localhost:4000 i Azure, med samma image.
 COPY client/nginx.conf.template /etc/nginx/templates/default.conf.template
+# M8: säkerhetsheadrarna, inkluderade av varje location i mallen ovan.
+COPY client/security-headers.conf /etc/nginx/security-headers.conf
 ENV API_UPSTREAM=api:4000
 COPY --from=build /app/client/dist /usr/share/nginx/html
 
 EXPOSE 80
 # nginx-imagen har redan ett CMD som startar servern.
+
+# M8 (Trivy DS-0002): nginx-imagen startar som root för att få lyssna på port 80 och byter sedan
+# själv till användaren nginx för arbetsprocesserna. Vi låter det vara – och skriver undantaget
+# i .trivyignore med motivering. Alternativet är nginxinc/nginx-unprivileged på port 8080.

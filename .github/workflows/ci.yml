@@ -1,4 +1,4 @@
-# Utpost – CI (M1, utbyggd i M4, M5, M6, M7)
+# Utpost – CI (M1, utbyggd i M4, M5, M6, M7, M8)
 # Varje PR mot main och varje push till main: lint, formatkontroll, typkontroll, tester och bygge.
 # Rött någonstans = PR:en får inte mergas (branch protection kräver "Kvalitet", "Bygg", "Integration" och "Image").
 # M4: jobbet Image bygger Docker-imagerna. På PR byggs de bara (går Dockerfilen igenom?),
@@ -84,6 +84,71 @@ jobs:
       - run: npm run migrate:logs  # mätpunkterna till Mongo – testet för Tour.logs kräver det
       - run: npm run test:api
 
+  # M8: säkerhetsskanning. Tre verktyg, tre frågor, i den ordning de blir dyrare:
+  #   npm audit – har våra beroenden kända sårbarheter? (SCA, sekunder)
+  #   Trivy     – samma fråga ur en annan databas, plus hemligheter i repot och misstag i Dockerfiles (sekunder),
+  #               och sedan hela api-imagen: Alpine-paketen och Node, inte bara våra npm-paket
+  #   ZAP       – anropar den KÖRANDE appen som en angripare skulle: saknade headers, läckt serverinfo (DAST, minuter)
+  # Jobbet körs på varje PR, parallellt med Kvalitet – det behöver inget av de andra jobben.
+  # Rött här blockerar merge (branch protection kräver "Säkerhet").
+  security:
+    name: Säkerhet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      - name: Beroenden – npm audit (bara det som körs i produktion, high och critical)
+        run: npm audit --omit=dev --audit-level=high
+      # Trivy mot repot: package-lock.json (sårbarheter), alla filer (hemligheter – nycklar, tokens,
+      # anslutningssträngar som råkat committas) och Dockerfiles (misconfig: root-användare, saknad HEALTHCHECK …).
+      # .trivyignore listar de fynd vi medvetet låter vara, med motivering.
+      - name: Repot – Trivy (beroenden, hemligheter, Dockerfiles)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          trivyignores: .trivyignore
+      # Hela appen startas som i compose – det är den ZAP ska anropa, och api-imagen som Trivy ska skanna.
+      - name: Bygg imagerna och starta appen (compose)
+        run: docker compose up -d --build --wait
+
+      - name: "Imagen – Trivy (api-imagen: Alpine-paket, Node, npm-paket)"
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: utpost-api
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          trivyignores: .trivyignore
+      # ZAP baseline: spindlar sidan en minut och kör de passiva reglerna på varje svar.
+      # Vilka regler som gör jobbet rött står i .zap/rules.tsv (FAIL/WARN/IGNORE). Rapporten laddas
+      # upp som artefakt. Appen svarar på localhost:3001 – nginx i client-containern, precis som i compose
+      # (actionen kör ZAP-containern med --network host, så localhost är runnern).
+      # -a: även alpha-reglerna. -I: en WARN ger inte felkod – utan -I ger ZAP exit 2 på varje WARN, och
+      # actionen räknar exit 2 som fel när fail_action är true. FAIL-regler ger exit 1 och stoppar fortfarande.
+      - name: Appen – ZAP baseline (DAST) mot den körande appen
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: 'http://localhost:3001'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a -I'
+          fail_action: true
+          allow_issue_writing: false
+          artifact_name: zap-rapport
+
+      - name: Loggar från appen (bara om något gick fel)
+        if: failure()
+        run: docker compose logs --tail 50 api client
   build:
     name: Bygg
     runs-on: ubuntu-latest     # körs parallellt med quality – de behöver inte varandra

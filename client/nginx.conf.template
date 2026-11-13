@@ -4,19 +4,24 @@
 # resultatet i /etc/nginx/conf.d/default.conf. ${API_UPSTREAM} byts mot miljövariabeln –
 # api:4000 i compose, localhost:4000 i Azure där api kör som sidecar i samma app.
 # nginx egna variabler ($uri, $host …) rörs inte: envsubst byter bara ut namn som finns i miljön.
+#
+# M8: security-headers.conf inkluderas i varje location (nginx ärver inte add_header mellan nivåer).
 server {
   listen 80;
   root /usr/share/nginx/html;
+  server_tokens off;   # M8: nginx skriver inte ut sin version i svaren (A02)
 
   # Vue Router sköter adresserna i browsern. /guider/kebnekaise finns inte som fil –
   # hittas ingen fil skickas index.html, och routern tar det därifrån.
   location / {
+    include /etc/nginx/security-headers.conf;
     try_files $uri $uri/ /index.html;
   }
 
   # Filerna i assets/ har en hash i namnet (index-S-W114i7.js). Nytt bygge = nytt namn,
   # så browsern får spara dem hur länge som helst.
   location /assets/ {
+    include /etc/nginx/security-headers.conf;
     expires 1y;
     add_header Cache-Control "public, immutable";
   }
@@ -24,9 +29,13 @@ server {
   # Browsern pratar bara med den här servern. Anrop till /api och /graphql skickas vidare
   # till API:et – adressen kommer från miljön, inte från den här filen.
   location /api/ {
+    include /etc/nginx/security-headers.conf;
+    add_header Cache-Control "no-store" always;   # M8: svar med token eller personuppgifter cachas aldrig
     proxy_pass http://${API_UPSTREAM};
   }
   location /graphql {
+    include /etc/nginx/security-headers.conf;
+    add_header Cache-Control "no-store" always;
     proxy_pass http://${API_UPSTREAM};
   }
 }

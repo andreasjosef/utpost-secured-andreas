@@ -10,6 +10,10 @@ COPY package.json package-lock.json ./
 COPY shared/package.json shared/
 COPY api/package.json api/
 RUN npm ci --workspace=api --omit=dev
+# M8 (Trivy image): npm behövs för att installera, inte för att köra. Basimagen node:22-alpine skickar med
+# npm och dess egna beroenden (pacote, sigstore, brace-expansion …) – sårbarheter i dem är fynd i VÅR image
+# fast de aldrig står i vår lockfil. API:et startas med `node`, så npm tas bort ur den färdiga imagen.
+RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
 # Sedan koden. Ändras ofta, ligger därför sist.
 COPY shared/ shared/
@@ -17,6 +21,10 @@ COPY api/ api/
 
 WORKDIR /app/api
 EXPOSE 4000
+
+# M8 (A02, Trivy DS-0002): processen kör inte som root. node-imagen har användaren `node` färdig.
+# Allt är redan kopierat och installerat ovanför – node behöver bara läsa.
+USER node
 
 # M6: commiten imagen byggdes från. Pipelinen skickar in den (build-args), lokalt blir det "dev".
 # Syns i /api/health som `sha` – det är så deploysteget vet att molnet kör rätt version.
