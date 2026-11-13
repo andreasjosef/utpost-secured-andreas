@@ -5,6 +5,8 @@
 **Datum:** ______
 **Hotbilden i en mening:** ______ (vad är värt att skydda i Utpost, och vem är angriparen? Användarnas turer och bilder, redaktionens guider, och – när vi lanserar – kontona. Angriparen är oftast ett skript, inte en person.)
 
+https://github.com/andreasjosef/utpost-secured-andreas/actions/runs/43422981076
+
 ## Autentiseringen (M8)
 
 - Lösenord: ______ (hur lagras de, med vilket schema? Var i koden?)
