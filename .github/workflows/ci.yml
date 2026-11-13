@@ -104,6 +104,19 @@ jobs:
 
       - name: Beroenden – npm audit (bara det som körs i produktion, high och critical)
         run: npm audit --omit=dev --audit-level=high
+      # Trivy mot repot: package-lock.json (sårbarheter), alla filer (hemligheter – nycklar, tokens,
+      # anslutningssträngar som råkat committas) och Dockerfiles (misconfig: root-användare, saknad HEALTHCHECK …).
+      # .trivyignore listar de fynd vi medvetet låter vara, med motivering.
+      - name: Repot – Trivy (beroenden, hemligheter, Dockerfiles)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          trivyignores: .trivyignore
   build:
     name: Bygg
     runs-on: ubuntu-latest     # körs parallellt med quality – de behöver inte varandra
