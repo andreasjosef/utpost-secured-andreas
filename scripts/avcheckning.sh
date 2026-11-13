@@ -51,7 +51,7 @@ steps "$sk" "Säkerhet"
 
 # ── Terminalen ────────────────────────────────────────────────────────
 h "4. Headers från compose"
-if curl -sf -o /dev/null localhost:3001/api/health; then
+if curl -sf -o /dev/null localhost:3001/; then
   echo "${D}appen kör redan på :3001${N}"
 elif [[ "${1:-}" != "--no-docker" ]]; then
   if command -v docker >/dev/null; then dc=(docker compose); else dc=(podman-compose); fi
